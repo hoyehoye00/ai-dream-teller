@@ -117,3 +117,78 @@
    - 회원 and 비회원 유저 리스트 표 페이지 
    - 회원과 비회원을 필터링해서 볼 수 있는 기능 
    - 각 회원의 결제 여부를 확인할 수 있음
+
+## 6. API 설계 구조 (백엔드 작업용)
+Next.js App Router의 Route Handlers (`app/api/...`) 및 Supabase를 기준으로 MECE(Mutually Exclusive, Collectively Exhaustive)하게 설계된 API 구조입니다. 필요에 따라 데이터 변경(Mutation) 로직은 Next.js Server Actions로 전환하여 구현할 수 있습니다.
+
+### 6.1 인증 및 유저 관리 (Auth & Users)
+- **`POST /api/auth/guest/login`**: 비회원 로그인 (전화번호 및 비밀번호 기반 인증 처리)
+- **`POST /api/auth/guest/logout`**: 비회원 로그아웃 처리
+- **`GET /api/users/me`**: 현재 로그인된 유저(회원/비회원)의 프로필 정보 및 권한 조회
+- **`PATCH /api/users/me`**: 회원 프로필 수정 (닉네임 등)
+*(※ 회원의 소셜 로그인은 Supabase Auth의 OAuth 기능을 우선 활용합니다.)*
+
+### 6.2 꿈 해몽 및 피드 (Dreams)
+- **`GET /api/dreams/feed`**: 공개 설정된 유저들의 해몽 결과 리스트 조회 (피드 페이지용, Pagination 지원)
+- **`GET /api/dreams/[dream-id]`**: 특정 해몽 결과 상세 조회 (해석 확인 페이지용)
+- **`POST /api/dreams/generate`**: (내부/웹훅) 결제 완료 후 Gemini API를 호출하여 해몽 텍스트 및 이미지를 생성하고 DB에 저장
+
+### 6.3 주문 및 결제 (Orders & Payments)
+- **`POST /api/orders`**: 새로운 꿈 해몽 주문 생성 (입력한 꿈 내용, 선택 옵션, 전문 분야 저장 후 임시 `order-id` 발급)
+- **`GET /api/orders/me`**: 본인(회원/비회원)의 결제 및 주문 내역 리스트 조회 (마이페이지, 비회원 주문 조회용)
+- **`GET /api/orders/[order-id]`**: 특정 주문 및 결제 상세 상태 조회
+- **`POST /api/payments/confirm`**: 토스페이먼츠 결제 승인 요청 및 DB 상태 업데이트 (성공 시 `dreams/generate` 로직 비동기 트리거)
+
+### 6.4 관리자 전용 (Admin) - *Admin 권한 검증 필수*
+- **`GET /api/admin/dashboard`**: 기간별 전체 매출, 주문 건수 등 통계 데이터 조회
+- **`GET /api/admin/orders`**: 전체 주문 내역 리스트 조회 (회원/비회원, 결제 상태 필터 및 Pagination 지원)
+- **`GET /api/admin/orders/[order-id]`**: 단일 주문 상세 내역 조회 (유저 원본 입력, LLM 결과, AI 이미지 포함)
+- **`POST /api/admin/orders/[order-id]/regenerate`**: 특정 주문의 해몽 텍스트/이미지를 LLM을 통해 강제로 재생성
+- **`GET /api/admin/users`**: 가입된 유저 및 결제 이력이 있는 비회원 리스트 조회 (필터링 및 Pagination 지원)
+
+## 7. 데이터베이스 스키마 설계 (DB Schema)
+Supabase (PostgreSQL) 환경을 기준으로 MECE하게 설계된 테이블 구조입니다. 각 테이블명과 칼럼명은 직관적으로 구성되었습니다.
+
+### 7.1 `users` 테이블 (회원 및 비회원 프로필)
+Supabase Auth(`auth.users`)와 연동되거나 비회원용 자체 인증(전화번호) 정보를 통합 관리하는 테이블입니다.
+
+| Column Name | Data Type | Null 여부 | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID | Not Null | PK, 회원인 경우 `auth.users.id`와 매핑, 비회원인 경우 UUID 자동 생성 |
+| `role` | VARCHAR | Not Null | 유저 권한 (Enum: `admin`, `member`, `guest`) |
+| `nickname` | VARCHAR | Null | 회원의 닉네임 |
+| `phone_number` | VARCHAR | Null | 비회원 로그인용 전화번호 (회원의 경우 Null) |
+| `password_hash` | VARCHAR | Null | 비회원 로그인용 비밀번호 해시 |
+| `created_at` | TIMESTAMPTZ | Not Null | 계정 생성 일시 (Default: now()) |
+| `updated_at` | TIMESTAMPTZ | Not Null | 계정 수정 일시 (Default: now()) |
+
+### 7.2 `orders` 테이블 (주문 및 결제 정보)
+토스페이먼츠 연동을 통한 결제 상태와 금액 내역을 관리하는 테이블입니다.
+
+| Column Name | Data Type | Null 여부 | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID | Not Null | PK, 주문 고유 ID |
+| `user_id` | UUID | Not Null | FK (`users.id`), 주문자 ID (회원 또는 비회원) |
+| `status` | VARCHAR | Not Null | 결제 상태 (Enum: `pending`, `paid`, `failed`, `cancelled`) |
+| `total_amount` | INTEGER | Not Null | 최종 결제 금액 (예: 텍스트 기본 1500, 이미지 추가 시 2000 등) |
+| `payment_key` | VARCHAR | Null | 토스페이먼츠에서 발급받은 결제 키 (승인 시 업데이트) |
+| `created_at` | TIMESTAMPTZ | Not Null | 주문 생성 일시 (Default: now()) |
+| `updated_at` | TIMESTAMPTZ | Not Null | 주문 업데이트 및 결제 완료 일시 (Default: now()) |
+
+### 7.3 `dreams` 테이블 (꿈 원본 및 AI 해몽 결과)
+사용자의 입력과 AI(Gemini API)가 생성한 해몽 텍스트 및 이미지를 저장하는 테이블입니다. `orders` 테이블과 1:1 관계를 가집니다.
+
+| Column Name | Data Type | Null 여부 | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID | Not Null | PK, 꿈 해몽 고유 ID |
+| `order_id` | UUID | Not Null | FK (`orders.id`), 연결된 주문 ID (Unique) |
+| `user_id` | UUID | Not Null | FK (`users.id`), 작성자 ID |
+| `content` | TEXT | Not Null | 사용자가 입력한 꿈의 원본 내용 |
+| `expert_type` | VARCHAR | Not Null | 선택한 해몽 전문 분야 (Enum: `freud`, `jung`, `neuroscience`, `gestalt`) |
+| `include_image` | BOOLEAN | Not Null | AI 이미지 생성 옵션 구매 여부 |
+| `interpretation_text` | TEXT | Null | AI가 생성한 해몽 텍스트 (AI 처리 완료 전엔 Null) |
+| `interpretation_image_url`| VARCHAR | Null | AI가 생성한 해몽 이미지 URL (생성 전이거나 옵션 미구매시 Null) |
+| `is_public` | BOOLEAN | Not Null | 피드 공개 여부 (Default: true) |
+| `status` | VARCHAR | Not Null | AI 생성 상태 (Enum: `pending`, `generating`, `completed`, `failed`) |
+| `created_at` | TIMESTAMPTZ | Not Null | 해몽 요청 생성 일시 (Default: now()) |
+| `updated_at` | TIMESTAMPTZ | Not Null | 해몽 완료/수정 일시 (Default: now()) |
